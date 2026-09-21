@@ -1,5 +1,7 @@
 # 串口丢包统计工具
 
+![CI](https://github.com/ZZH-gh/zhuabaogongju/actions/workflows/ci.yml/badge.svg)
+
 面向 SSCOM 等串口助手导出日志的 Windows 桌面工具。拖入 `.txt`、`.csv` 或 `.dat` 日志后，工具会先建立可复核的“方向 → 完整帧 → 序号”证据链，再统计接收方向的协议层丢包。
 
 ## 功能
@@ -57,6 +59,12 @@ py -m PyInstaller --noconfirm --onefile --windowed --name SerialLossAnalyzer --i
 ```
 
 生成文件为 `dist\SerialLossAnalyzer.exe`。
+
+## 下载、发布与授权
+
+- 普通 Windows 使用者可从 [Releases](https://github.com/ZZH-gh/zhuabaogongju/releases) 下载 `SerialLossAnalyzer.exe`，无需安装 Python。
+- 推送到 `main` 会自动执行单元测试与源码语法检查；推送形如 `v1.0.1` 的版本标签后，GitHub Actions 会重新测试、构建 EXE、生成 SHA-256 校验文件并创建对应 Release。
+- 项目采用 [MIT License](LICENSE)：允许个人、企业使用、修改和再发布；副本需保留版权和许可声明，软件按“现状”提供、不附带担保。
 
 ## 限制
 
