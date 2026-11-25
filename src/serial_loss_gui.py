@@ -19,8 +19,9 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 from frame_parser import CrcKind, FrameConfig, FrameProtocol, OperationCancelled, parse_chunks
 from serial_loss_analyzer import (
     CycleResult, Gap, analyze_cycles, analyze_log, analyze_time_windows, analyze_timestamp_gaps,
-    analyze_timestamp_windows, detect_modbus_rtu, detect_protocol, detect_sequence_field,
-    detect_timestamp_table, match_transactions, parse_hex, read_directional_chunks,
+    analyze_timestamp_windows, continuous_gaps, detect_ble_blocks, detect_modbus_rtu, detect_protocol,
+    detect_sequence_field, detect_timestamp_table, match_transactions, parse_hex, read_directional_chunks,
+    uses_ble_block_sequence,
 )
 
 
@@ -819,9 +820,15 @@ class LossAnalyzerApp:
             self.evidence_rows.append(row)
             self.evidence.insert("", END, values=(row["frame"], row["lines"], row["time"], row["bytes"], row["sequence"], row["status"]))
 
-    def populate_time_windows(self, parsed, sequences: list[int], sequence_size: int, max_gap: int, window_seconds: int) -> tuple[float | None, list]:
+    def populate_time_windows(
+        self, parsed, sequences: list[int], sequence_size: int, max_gap: int, window_seconds: int,
+        *, block_mode: bool = False,
+    ) -> tuple[float | None, list]:
         self.time_table.delete(*self.time_table.get_children())
-        baseline, windows = analyze_time_windows(parsed.frame_evidence, sequences, sequence_size, max_gap, window_seconds)
+        self.time_table.heading("frames", text="有效块数" if block_mode else "有效记录")
+        baseline, windows = analyze_time_windows(
+            parsed.frame_evidence, sequences, sequence_size, max_gap, window_seconds, block_mode=block_mode,
+        )
         for window in windows:
             average = f"{window.average_interval_ms:.1f} ms" if window.average_interval_ms is not None else "—"
             maximum = f"{window.max_interval_ms:.1f} ms" if window.max_interval_ms is not None else "—"
@@ -1054,7 +1061,12 @@ class LossAnalyzerApp:
                     )
             else:
                 self.transaction_note = ""
-            modbus = detect_modbus_rtu(self.input_chunks, self.progress_callback("正在验证 Modbus 帧"))
+            ble_blocks = detect_ble_blocks(self.direction_read)
+            if self.direction_read.ble_status_records:
+                self.direction_note += f" 已剥离 {self.direction_read.ble_status_records} 条 BLE DISCONNECT 状态前缀。"
+            modbus = None if ble_blocks else detect_modbus_rtu(
+                self.input_chunks, self.progress_callback("正在验证 Modbus 帧"),
+            )
             if modbus is not None:
                 captured, parsed = modbus
                 suggested = detect_sequence_field(captured)
@@ -1085,11 +1097,15 @@ class LossAnalyzerApp:
                     "以下参数是候选值，点击“参数自检”可查看具体帧。"
                 )
                 return
-            detected = detect_protocol(self.input_stream, self.progress_callback("正在推断固定帧"))
+            detected = ble_blocks or detect_protocol(self.input_stream, self.progress_callback("正在推断固定帧"))
             if detected is None:
                 raise ValueError("日志数据不足，或未找到间距稳定的固定长度帧。")
             self._setting_parameters = True
             try:
+                if ble_blocks or self._auto_display_mode == "modbus":
+                    self.profile.set("自定义固定帧")
+                    self.crc.set(CrcKind.NONE.value)
+                    self._auto_display_mode = None
                 self.header.set(detected.header.hex().upper())
                 self.frame_size.set(str(detected.frame_size))
                 if detected.seq_offset is not None:
@@ -1105,13 +1121,14 @@ class LossAnalyzerApp:
                 self._setting_parameters = False
             self.parameter_source.set("自动识别候选（请自检）")
             self.invalidate_preview()
+            evidence_text = "记录边界吻合率" if ble_blocks else "帧间距置信度"
             self.result.set(
                 f"已自动识别：帧头 {detected.header.hex(' ').upper()}，总帧长 {detected.frame_size} 字节；{sequence_text}。\n"
-                f"{self.direction_note} 间距置信度 {detected.confidence:.0%}；请核对后点击“开始统计”。\n{self.transaction_note}"
+                f"{self.direction_note} {evidence_text} {detected.confidence:.0%}；请核对后点击“开始统计”。\n{self.transaction_note}"
             )
             self.rule_summary.set(
                 f"当前文件识别：固定帧头 {detected.header.hex(' ').upper()}，总帧长 {detected.frame_size} 字节，"
-                f"{sequence_text}，帧间距置信度 {detected.confidence:.0%}。"
+                f"{sequence_text}，{evidence_text} {detected.confidence:.0%}。"
             )
         except OperationCancelled:
             self.result.set("自动识别已取消；当前参数未改变。")
@@ -1176,6 +1193,7 @@ class LossAnalyzerApp:
         self.comparison_export_button.configure(state="normal" if self.comparison_rows else "disabled")
 
     def analyze_timestamp_table(self) -> None:
+        self.time_table.heading("frames", text="有效记录")
         """Analyze an already-decoded table log without pretending it is UART HEX."""
         if self.timestamp_table is None:
             raise ValueError("尚未识别到时间戳表格日志。")
@@ -1285,7 +1303,10 @@ class LossAnalyzerApp:
             sequences = [int.from_bytes(frame[seq_offset : seq_offset + seq_size], self.endian.get()) for frame in captured]
             if not sequences:
                 raise ValueError("没有找到完整帧。请检查帧头和总帧长。")
-            cyclic = analyze_cycles(sequences, coverage, manual_start, manual_count)
+            block_mode = uses_ble_block_sequence(self.direction_read, config, seq_offset, seq_size, self.endian.get())
+            cyclic = None if block_mode and manual_count is None else analyze_cycles(
+                sequences, coverage, manual_start, manual_count,
+            )
         except OperationCancelled:
             self.result.set("统计已取消；未覆盖上一份统计结果。")
             return
@@ -1350,37 +1371,35 @@ class LossAnalyzerApp:
         else:
             self.ignore_cycles_button.configure(state="disabled")
             self.restore_cycles_button.configure(state="disabled")
-            modulus = 1 << (8 * seq_size)
-            duplicates = resets = 0
-            for previous, current in zip(sequences, sequences[1:]):
-                advance = (current - previous) % modulus
-                if advance == 0:
-                    duplicates += 1
-                elif advance == 1:
-                    continue
-                elif advance - 1 <= max_gap:
-                    self.gaps.append(Gap(previous, (previous + 1) % modulus, (current - 1) % modulus, advance - 1))
-                else:
-                    resets += 1
+            self.gaps, duplicates, resets = continuous_gaps(sequences, seq_size, max_gap, block_mode=block_mode)
             missing = sum(gap.count for gap in self.gaps)
-            rate = 100 * missing / (len(sequences) + missing)
-            primary_label = "连续序号丢包率"
-            primary_detail = f"统计口径：有效完整帧 {len(sequences)}，缺失帧 {missing}；重复和异常跳变不计作丢包。"
+            received = len(sequences) - duplicates if block_mode else len(sequences)
+            rate = 100 * missing / (received + missing)
+            primary_label = "块编号缺失率" if block_mode else "连续序号丢包率"
+            primary_detail = (
+                f"统计口径：有效块 {received}，块编号缺失 {missing}；相邻同号合并，编号下降划分区段。"
+                if block_mode else f"统计口径：有效完整帧 {len(sequences)}，缺失帧 {missing}；重复和异常跳变不计作丢包。"
+            )
             analysis_stats = {
                 "mode": "continuous", "received_frames": len(sequences), "missing_frames": missing,
                 "loss_percent": rate, "duplicates": duplicates, "restart_or_outlier": resets,
                 "gaps": [{"after": gap.after, "first_missing": gap.first_missing, "last_missing": gap.last_missing, "count": gap.count} for gap in self.gaps],
             }
+            if block_mode:
+                analysis_stats["received_blocks"] = received
             self.set_table_headings((("after", "前一序号"), ("first", "首个缺失"), ("last", "最后缺失"), ("count", "缺失帧数")))
             for gap in self.gaps:
                 self.table.insert("", END, values=(gap.after, gap.first_missing, gap.last_missing, gap.count))
             self.result.set(
-                f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n连续序号模式：接收帧数 {len(sequences)}，丢失帧数 {missing}，丢包率 {rate:.4f}%。\n"
+                f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n"
+                f"{primary_label} {rate:.4f}%。{primary_detail}\n"
                 f"重复序号：{duplicates}    疑似复位/异常跳变：{resets}    缺失区段：{len(self.gaps)}\n{self.transaction_note}"
             )
         self.set_primary_loss(rate, primary_label, primary_detail)
         self.populate_evidence(parsed, sequences)
-        interval_baseline, time_windows = self.populate_time_windows(parsed, sequences, seq_size, max_gap, time_window)
+        interval_baseline, time_windows = self.populate_time_windows(
+            parsed, sequences, seq_size, max_gap, time_window, block_mode=block_mode and not self.cyclic_mode,
+        )
         self.populate_comparisons(config, seq_offset, seq_size, self.endian.get(), max_gap, coverage, manual_start, manual_count)
         if time_windows:
             worst = max(time_windows, key=lambda item: (item.loss_percent, item.long_intervals, item.max_interval_ms or 0))
@@ -1406,6 +1425,7 @@ class LossAnalyzerApp:
                 "markers_found": bool(self.direction_read and self.direction_read.direction_markers_found),
                 "raw_binary_capture": bool(self.direction_read and self.direction_read.raw_binary_capture),
                 "raw_binary_receive": bool(self.direction_read and self.direction_read.raw_binary_receive),
+                "ble_status_records": self.direction_read.ble_status_records if self.direction_read else 0,
                 "rx_records": len(self.direction_read.rx_chunks) if self.direction_read else 0,
                 "tx_records": len(self.direction_read.tx_chunks) if self.direction_read else 0,
                 "unknown_records": len(self.direction_read.unknown_chunks) if self.direction_read else 0,

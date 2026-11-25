@@ -9,12 +9,42 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from frame_parser import CrcKind, FrameConfig, FrameEvidence, FrameProtocol, OperationCancelled, RxChunk, crc16_modbus, parse_chunks
 from serial_loss_analyzer import (
     DirectionRead, LoggedChunk, SSCOM_RX_LABEL, SSCOM_TX_LABEL, analyze_cycles, analyze_time_windows,
-    analyze_log, analyze_timestamp_gaps, analyze_timestamp_windows, detect_protocol,
+    analyze_log, analyze_timestamp_gaps, analyze_timestamp_windows, detect_ble_blocks, detect_protocol,
     detect_sequence_field, detect_timestamp_table, match_transactions, read_directional_chunks,
 )
 
 
 class SerialLogTests(unittest.TestCase):
+    def test_ble_status_wrapped_blocks_ignore_repeats_and_leading_boundary(self):
+        payloads = [
+            b"\xa5\x01\x12" + value.to_bytes(2, "big") + b"\x06\xb4" + bytes(187) + b"\x5a" + bytes([status])
+            for value in (0xFFFF, 1, 2, 3, 5, 6, 7)
+            for status in (0xD1, 0xD2, 0xD3)
+        ]
+        payloads.insert(6, b"\x01\x03\x02\x00\x00\xb8\x44")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.TXT"
+            path.write_bytes(b"".join(
+                f"[16:10:{index:02d}.000]".encode() + SSCOM_RX_LABEL
+                + (b"BLE DISCONNECT\r\r\n" + payload).hex(" ").encode() + b"\r\n"
+                for index, payload in enumerate(payloads)
+            ))
+            read = read_directional_chunks(path)
+            detection = detect_ble_blocks(read)
+            self.assertIsNotNone(detection)
+            self.assertEqual((detection.header, detection.frame_size), (b"\xa5\x01\x12", 196))
+            self.assertEqual((detection.seq_offset, detection.seq_size, detection.endian), (3, 2, "big"))
+            self.assertEqual(read.ble_status_records, len(payloads))
+            config = FrameConfig(header=detection.header, fixed_length=detection.frame_size)
+            analysis = analyze_log(path, config, detection.seq_offset, detection.seq_size, detection.endian, 1000)
+        self.assertEqual((len(analysis.sequences), analysis.duplicates, analysis.resets), (21, 14, 1))
+        self.assertEqual([gap.first_missing for gap in analysis.gaps], [4])
+        self.assertAlmostEqual(analysis.loss_percent, 12.5)
+        _, windows = analyze_time_windows(
+            analysis.parsed.frame_evidence, analysis.sequences, 2, 1000, block_mode=True,
+        )
+        self.assertEqual((windows[0].received, windows[0].missing), (7, 1))
+
     def test_sequence_detector_rejects_slowly_varying_measurement_values(self):
         # The changing byte looks locally smooth, but repeated and backwards
         # values prove it is a measurement, not a packet counter.

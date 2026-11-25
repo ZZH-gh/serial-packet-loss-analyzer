@@ -12,8 +12,10 @@ import csv
 import re
 import statistics
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import groupby
 from pathlib import Path
 from typing import Callable
 
@@ -35,6 +37,9 @@ TABLE_TIMESTAMP_SUFFIX = re.compile(
 # them at byte level is therefore more reliable than decoding with replacement.
 SSCOM_TX_LABEL = bytes.fromhex("B7 A2 A1 FA A1 F3")
 SSCOM_RX_LABEL = bytes.fromhex("CA D5 A1 FB A1 F4")
+BLE_STATUS_PREFIX = b"BLE DISCONNECT\r\r\n"
+BLE_BLOCK_HEADER = bytes.fromhex("A5 01 12")
+BLE_BLOCK_SEQUENCE = (3, 2, "big")
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,7 @@ class DirectionRead:
     native_sscom_markers: int = 0
     raw_binary_capture: bool = False
     raw_binary_receive: bool = False
+    ble_status_records: int = 0
 
     @property
     def direction_confidence(self) -> float:
@@ -366,7 +372,7 @@ def analyze_timestamp_windows(
 
 def analyze_time_windows(
     evidence: list, sequences: list[int], sequence_size: int, max_sequence_gap: int,
-    window_seconds: int = 60,
+    window_seconds: int = 60, *, block_mode: bool = False,
 ) -> tuple[float | None, list[TimeWindowResult]]:
     """Group valid RX frames by time and locate sequence gaps / long pauses.
 
@@ -404,7 +410,8 @@ def analyze_time_windows(
     previous_item = previous_value = None
     for item, value in timestamped:
         bucket = bucket_at(item.first_timestamp)
-        bucket["received"] += 1
+        if not block_mode or value != previous_value:
+            bucket["received"] += 1
         if previous_item is not None:
             interval = (item.first_timestamp - previous_item.first_timestamp).total_seconds() * 1000
             if interval >= 0:
@@ -445,7 +452,10 @@ def analyze_log(
     sequences = [int.from_bytes(frame[sequence_offset : sequence_offset + sequence_size], endian) for frame in parsed.frames]
     if not sequences:
         raise ValueError("没有找到完整帧")
-    cyclic = analyze_cycles(sequences, min_coverage, expected_start, expected_count)
+    block_mode = uses_ble_block_sequence(direction_read, frame_config, sequence_offset, sequence_size, endian)
+    cyclic = None if block_mode and expected_count is None else analyze_cycles(
+        sequences, min_coverage, expected_start, expected_count,
+    )
     if cyclic:
         model, cycles = cyclic
         included = [cycle for cycle in cycles if cycle.included]
@@ -454,10 +464,25 @@ def analyze_log(
         rate = 100 * missing / (received + missing) if received + missing else 0.0
         return LogAnalysis(path, direction_read, parsed, sequences, model, cycles, [], 0, 0, missing, rate)
 
+    gaps, duplicates, resets = continuous_gaps(sequences, sequence_size, max_sequence_gap, block_mode=block_mode)
+    missing = sum(gap.count for gap in gaps)
+    received = len(sequences) - duplicates if block_mode else len(sequences)
+    rate = 100 * missing / (received + missing) if received else 0.0
+    return LogAnalysis(path, direction_read, parsed, sequences, None, [], gaps, duplicates, resets, missing, rate)
+
+
+def continuous_gaps(
+    sequences: list[int], sequence_size: int, max_sequence_gap: int, *, block_mode: bool = False,
+) -> tuple[list[Gap], int, int]:
     modulus = 1 << (8 * sequence_size)
     gaps: list[Gap] = []
     duplicates = resets = 0
     for previous, current in zip(sequences, sequences[1:]):
+        # BLE block captures can begin with FFFF and then start at 0001.
+        # A descending jump only marks a boundary without a confirmed wrap rule.
+        if block_mode and current < previous:
+            resets += 1
+            continue
         advance = (current - previous) % modulus
         if advance == 0:
             duplicates += 1
@@ -467,9 +492,7 @@ def analyze_log(
             gaps.append(Gap(previous, (previous + 1) % modulus, (current - 1) % modulus, advance - 1))
         else:
             resets += 1
-    missing = sum(gap.count for gap in gaps)
-    rate = 100 * missing / (len(sequences) + missing) if sequences else 0.0
-    return LogAnalysis(path, direction_read, parsed, sequences, None, [], gaps, duplicates, resets, missing, rate)
+    return gaps, duplicates, resets
 
 
 def parse_hex(value: str) -> bytes:
@@ -590,6 +613,9 @@ def read_directional_chunks(
             elif active_direction:
                 direction = active_direction
             payload = _payload_bytes(payload_text)
+            if native and direction == "rx" and payload.startswith(BLE_STATUS_PREFIX):
+                result.ble_status_records += 1
+                payload = payload[len(BLE_STATUS_PREFIX):]
             if not payload:
                 continue
             chunk = RxChunk(payload, timestamp, line_no)
@@ -620,6 +646,39 @@ def read_receive_chunks(path: Path):
 def read_receive_bytes(path: Path) -> tuple[bytes, bool, int]:
     chunks, found_marker, rx_lines = read_receive_chunks(path)
     return b"".join(chunk.data for chunk in chunks), found_marker, rx_lines
+
+
+def detect_ble_blocks(direction_read: DirectionRead) -> Detection | None:
+    """Suggest a fixed block profile from status-prefixed SSCOM RX records."""
+    if not direction_read.ble_status_records:
+        return None
+    records = direction_read.rx_chunks
+    if direction_read.ble_status_records < len(records) * 0.8:
+        return None
+    sizes = Counter(
+        len(chunk.data) for chunk in records
+        if len(chunk.data) >= 7 and chunk.data.startswith(BLE_BLOCK_HEADER) and chunk.data[-2] == 0x5A
+    )
+    if not sizes:
+        return None
+    size, count = sizes.most_common(1)[0]
+    if count < 4 or count < len(records) * 0.8:
+        return None
+    values = [
+        int.from_bytes(chunk.data[3:5], "big") for chunk in records
+        if len(chunk.data) == size and chunk.data.startswith(BLE_BLOCK_HEADER) and chunk.data[-2] == 0x5A
+    ]
+    steps = [value for value, _ in groupby(values)]
+    offset, width, endian = BLE_BLOCK_SEQUENCE if _credible_sequence_score(steps, 2) is not None else (None, None, None)
+    return Detection(BLE_BLOCK_HEADER, size, offset, width, endian, count / len(records))
+
+
+def uses_ble_block_sequence(direction_read, frame_config, offset: int, width: int, endian: str) -> bool:
+    """Apply block statistics only to the recognized log and matching parameters."""
+    if frame_config.header != BLE_BLOCK_HEADER or (offset, width, endian) != BLE_BLOCK_SEQUENCE:
+        return False
+    detection = detect_ble_blocks(direction_read) if direction_read else None
+    return detection is not None and frame_config.fixed_length == detection.frame_size
 
 
 def frames(stream: bytes, header: bytes, frame_size: int):
