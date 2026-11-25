@@ -5,3 +5,4 @@ dist/
 build_update/
 dist_update/
 *.spec
+!/SerialLossAnalyzer.spec
