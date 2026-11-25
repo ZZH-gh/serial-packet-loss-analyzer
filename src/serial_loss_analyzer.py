@@ -120,16 +120,21 @@ class TransactionSummary:
     latency_ms: tuple[float, ...]
     eligible_sent: int = 0
     eligible_paired: int = 0
+    insufficient_sent: int = 0
+
+    @property
+    def eligible_observed(self) -> int:
+        return self.eligible_sent - self.insufficient_sent if self.eligible_sent else 0
 
     @property
     def eligible_unmatched(self) -> int:
-        return self.eligible_sent - self.eligible_paired
+        return self.eligible_observed - self.eligible_paired
 
     @property
     def response_loss_percent(self) -> float | None:
-        if not self.eligible_sent:
+        if not self.eligible_observed:
             return None
-        return 100 * self.eligible_unmatched / self.eligible_sent
+        return 100 * self.eligible_unmatched / self.eligible_observed
 
     @property
     def average_latency_ms(self) -> float | None:
@@ -372,7 +377,7 @@ def analyze_timestamp_windows(
 
 def analyze_time_windows(
     evidence: list, sequences: list[int], sequence_size: int, max_sequence_gap: int,
-    window_seconds: int = 60, *, block_mode: bool = False,
+    window_seconds: int = 60, *, block_mode: bool = False, cycle_mode: bool = False,
 ) -> tuple[float | None, list[TimeWindowResult]]:
     """Group valid RX frames by time and locate sequence gaps / long pauses.
 
@@ -406,27 +411,26 @@ def analyze_time_windows(
         )
         return buckets.setdefault(start, {"received": 0, "missing": 0, "intervals": [], "long": 0})
 
-    modulus = 1 << (8 * sequence_size)
     previous_item = previous_value = None
-    for item, value in timestamped:
+    for item, value in zip(evidence, sequences):
+        advance = None if previous_value is None else sequence_advance(
+            previous_value, value, sequence_size, max_sequence_gap, segment_on_decrease=block_mode or cycle_mode,
+        )
+        previous_value = value
+        if item.first_timestamp is None:
+            continue
         bucket = bucket_at(item.first_timestamp)
-        if not block_mode or value != previous_value:
+        if advance != 0:
             bucket["received"] += 1
+        if advance is not None and advance > 1:
+            bucket["missing"] += advance - 1
         if previous_item is not None:
             interval = (item.first_timestamp - previous_item.first_timestamp).total_seconds() * 1000
             if interval >= 0:
                 bucket["intervals"].append(interval)
                 if long_limit is not None and interval > long_limit:
                     bucket["long"] += 1
-            # A descending value begins a newly captured cycle (or a device
-            # restart).  It is never evidence of all the values between the
-            # two cycles being lost, so leave that boundary out of the time
-            # bucket loss count.  Normal ascending sequence gaps still use
-            # modular arithmetic to keep the existing gap definition.
-            advance = (value - previous_value) % modulus
-            if value >= previous_value and 2 <= advance <= max_sequence_gap + 1:
-                bucket["missing"] += advance - 1
-        previous_item, previous_value = item, value
+        previous_item = item
     results = [
         TimeWindowResult(
             start, data["received"], data["missing"],
@@ -466,9 +470,22 @@ def analyze_log(
 
     gaps, duplicates, resets = continuous_gaps(sequences, sequence_size, max_sequence_gap, block_mode=block_mode)
     missing = sum(gap.count for gap in gaps)
-    received = len(sequences) - duplicates if block_mode else len(sequences)
+    received = len(sequences) - duplicates
     rate = 100 * missing / (received + missing) if received else 0.0
     return LogAnalysis(path, direction_read, parsed, sequences, None, [], gaps, duplicates, resets, missing, rate)
+
+
+def sequence_advance(
+    previous: int, current: int, sequence_size: int, max_sequence_gap: int, *, segment_on_decrease: bool = False,
+) -> int | None:
+    """Classify a transition. None indicates an uncounted segment boundary."""
+    modulus = 1 << (8 * sequence_size)
+    advance = (current - previous) % modulus
+    # A short jump across the counter limit is plausible rollover. Use the
+    # same small-jump limit as counter detection when distinguishing resets.
+    if current < previous and (segment_on_decrease or advance > 32):
+        return None
+    return advance if advance <= max_sequence_gap + 1 else None
 
 
 def continuous_gaps(
@@ -478,20 +495,13 @@ def continuous_gaps(
     gaps: list[Gap] = []
     duplicates = resets = 0
     for previous, current in zip(sequences, sequences[1:]):
-        # BLE block captures can begin with FFFF and then start at 0001.
-        # A descending jump only marks a boundary without a confirmed wrap rule.
-        if block_mode and current < previous:
+        advance = sequence_advance(previous, current, sequence_size, max_sequence_gap, segment_on_decrease=block_mode)
+        if advance is None:
             resets += 1
-            continue
-        advance = (current - previous) % modulus
-        if advance == 0:
+        elif advance == 0:
             duplicates += 1
-        elif advance == 1:
-            continue
-        elif advance - 1 <= max_sequence_gap:
+        elif advance > 1:
             gaps.append(Gap(previous, (previous + 1) % modulus, (current - 1) % modulus, advance - 1))
-        else:
-            resets += 1
     return gaps, duplicates, resets
 
 
@@ -872,96 +882,93 @@ def detect_modbus_rtu(
     return parsed.frames, parsed
 
 
-def _modbus_key(data: bytes, is_request: bool) -> tuple[int, int, int | None] | None:
-    """Find a Modbus command key plus its expected/actual response size.
+def _modbus_request_key(data: bytes) -> tuple[int, int, int | bytes] | None:
+    from frame_parser import crc16_modbus
 
-    For read-holding/read-input-register commands (03/04), a request's
-    register count predicts the response byte-count.  Checking it prevents a
-    response for a different read command from satisfying the oldest request.
-    """
-    candidates: list[tuple[int, int, tuple[int, int, int | None]]] = []
-    for index in range(max(0, len(data) - 1)):
-        address, function = data[index], data[index + 1] & 0x7F
-        if 1 <= address <= 247 and 1 <= function <= 0x7F:
-            byte_count = None
-            confidence = 1
-            if function in (0x03, 0x04):
-                if is_request and len(data) >= index + 6:
-                    register_count = int.from_bytes(data[index + 4 : index + 6], "big")
-                    if 1 <= register_count <= 125:
-                        byte_count = register_count * 2
-                        confidence = 3
-                elif not is_request and len(data) >= index + 3:
-                    byte_count = data[index + 2]
-                    # A byte-count must be even for a 03/04 register reply.
-                    if byte_count and byte_count % 2 == 0:
-                        confidence = 3
-            candidates.append((confidence, -index, (address, function, byte_count)))
-    if not candidates:
-        return None
-    # Some SSCOM logs add transport bytes before the actual Modbus message.
-    # Prefer a complete 03/04 request/reply over an incidental byte pair in
-    # that wrapper, then prefer the earliest equally credible candidate.
-    return max(candidates)[2]
+    # Some exports put transport bytes in front of the request.
+    for start in range(len(data) - 7):
+        address, function = data[start:start + 2]
+        if not 1 <= address <= 247 or function not in (1, 2, 3, 4, 5, 6, 15, 16):
+            continue
+        length = 9 + data[start + 6] if function in (15, 16) else 8
+        frame = data[start:start + length]
+        if len(frame) != length or crc16_modbus(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
+            continue
+        if function in (1, 2, 3, 4):
+            count = int.from_bytes(frame[4:6], "big")
+            if function <= 2 and 1 <= count <= 2000:
+                return address, function, (count + 7) // 8
+            if function >= 3 and 1 <= count <= 125:
+                return address, function, count * 2
+        else:
+            return address, function, frame[2:6]
+    return None
 
 
 def match_transactions(direction_read: DirectionRead, timeout_ms: int | None = 1500) -> TransactionSummary:
-    """Pair TX requests with later RX replies, preferring the Modbus command key.
+    """Match complete Modbus replies, or show chronology alone for unknown protocols."""
+    from frame_parser import CrcKind, FrameConfig, FrameProtocol, parse_chunks
 
-    A matching address/function pair is required when both records look like
-    Modbus.  This avoids treating an unrelated response as the answer to the
-    oldest request when a log contains more than one command type.
-    """
-    waiting: list[tuple[object, tuple[int, int, int | None] | None]] = []
-    paired = orphan = key_confirmed = timed_out = 0
-    eligible_sent = eligible_paired = 0
+    tx_keys = {id(chunk): _modbus_request_key(chunk.data) for chunk in direction_read.tx_chunks}
+    eligible_sent = sum(key is not None for key in tx_keys.values())
+    config = FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS, max_frame_gap_ms=timeout_ms)
+    waiting: list[tuple[datetime | None, tuple[int, int, int | bytes] | None]] = []
+    paired = orphan = timed_out = 0
     latencies: list[float] = []
-    for record in direction_read.records:
-        if record.direction == "tx":
-            key = _modbus_key(record.chunk.data, is_request=True)
-            waiting.append((record.chunk, key))
-            eligible_sent += int(key is not None)
-        elif record.direction == "rx":
-            while (
-                waiting and timeout_ms is not None and waiting[0][0].timestamp and record.chunk.timestamp
-                and (record.chunk.timestamp - waiting[0][0].timestamp).total_seconds() * 1000 > timeout_ms
-            ):
-                waiting.pop(0)
-                timed_out += 1
-            if not waiting:
-                orphan += 1
-                continue
-            rx_key = _modbus_key(record.chunk.data, is_request=False)
-            match_index = next((
-                index for index, (_tx, tx_key) in enumerate(waiting)
-                if (
-                    rx_key is not None and tx_key is not None
-                    and tx_key[:2] == rx_key[:2]
-                    and (tx_key[2] is None or rx_key[2] is None or tx_key[2] == rx_key[2])
-                )
-            ), None)
-            if match_index is None:
-                # Preserve generic chronology pairing for non-Modbus logs, but
-                # do not claim it as a command-confirmed response.
-                if rx_key is not None and any(tx_key is not None for _tx, tx_key in waiting):
-                    orphan += 1
-                    continue
-                match_index = 0
-            tx, tx_key = waiting.pop(match_index)
-            paired += 1
-            if tx_key is not None and rx_key is not None and tx_key[:2] == rx_key[:2] and (
-                tx_key[2] is None or rx_key[2] is None or tx_key[2] == rx_key[2]
-            ):
-                key_confirmed += 1
-                eligible_paired += 1
-            if tx.timestamp and record.chunk.timestamp:
-                elapsed = (record.chunk.timestamp - tx.timestamp).total_seconds() * 1000
-                if elapsed >= 0:
-                    latencies.append(elapsed)
+
+    def expire(timestamp: datetime | None) -> None:
+        nonlocal timed_out
+        if timestamp is None or timeout_ms is None:
+            return
+        active = [
+            (tx_time, key) for tx_time, key in waiting
+            if tx_time is None or (timestamp - tx_time).total_seconds() * 1000 <= timeout_ms
+        ]
+        timed_out += len(waiting) - len(active)
+        waiting[:] = active
+
+    def pair(timestamp: datetime | None, address: int = 0, function: int = 0, detail: int | bytes | None = None) -> None:
+        nonlocal paired, orphan
+        expire(timestamp)
+        index = next((
+            i for i, (tx_time, key) in enumerate(waiting)
+            if (timestamp is None or tx_time is None or timestamp >= tx_time)
+            and (not eligible_sent or (key is not None and key[:2] == (address, function) and (detail is None or key[2] == detail)))
+        ), None)
+        if index is None:
+            orphan += 1
+            return
+        tx_time, _ = waiting.pop(index)
+        paired += 1
+        if timestamp is not None and tx_time is not None:
+            latencies.append((timestamp - tx_time).total_seconds() * 1000)
+
+    last_timestamp = None
+    for direction, group in groupby(direction_read.records, key=lambda record: record.direction):
+        chunks = [record.chunk for record in group]
+        if direction == "tx":
+            for chunk in chunks:
+                expire(chunk.timestamp)
+                key = tx_keys.get(id(chunk))
+                if key is not None or not eligible_sent:
+                    waiting.append((chunk.timestamp, key))
+        elif direction == "rx":
+            if eligible_sent:
+                for evidence in parse_chunks(chunks, config).frame_evidence:
+                    frame = evidence.frame
+                    function = frame[1] & 0x7F
+                    detail = frame[2] if function <= 4 else frame[2:6]
+                    pair(evidence.last_timestamp, frame[0], function, None if frame[1] & 0x80 else detail)
+            else:
+                for chunk in chunks:
+                    pair(chunk.timestamp)
+        last_timestamp = next((chunk.timestamp for chunk in reversed(chunks) if chunk.timestamp), last_timestamp)
+        expire(last_timestamp)
+
+    key_confirmed = paired if eligible_sent else 0
     return TransactionSummary(
-        len(direction_read.tx_chunks), len(direction_read.rx_chunks), paired,
-        len(waiting) + timed_out, timed_out, orphan, key_confirmed, tuple(latencies),
-        eligible_sent, eligible_paired,
+        len(direction_read.tx_chunks), len(direction_read.rx_chunks), paired, timed_out, timed_out,
+        orphan, key_confirmed, tuple(latencies), eligible_sent, key_confirmed, len(waiting),
     )
 
 
@@ -1008,22 +1015,10 @@ def main() -> int:
         print("No complete frames found. Check --header and --frame-size.", file=sys.stderr)
         return 2
 
-    modulus = 1 << (8 * args.seq_size)
-    gaps: list[Gap] = []
-    duplicates = resets = 0
-    for previous, current in zip(sequences, sequences[1:]):
-        advance = (current - previous) % modulus
-        if advance == 0:
-            duplicates += 1
-        elif advance == 1:
-            continue
-        elif advance - 1 <= args.max_gap:
-            gaps.append(Gap(previous, (previous + 1) % modulus, (current - 1) % modulus, advance - 1))
-        else:
-            resets += 1
+    gaps, duplicates, resets = continuous_gaps(sequences, args.seq_size, args.max_gap)
 
     missing = sum(gap.count for gap in gaps)
-    expected = len(sequences) + missing
+    expected = len(sequences) - duplicates + missing
     loss_rate = 100 * missing / expected if expected else 0.0
     print(f"Captured frames : {len(sequences)}")
     print(f"Missing frames  : {missing}")

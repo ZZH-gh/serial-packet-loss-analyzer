@@ -19,6 +19,30 @@ class FrameParserTests(unittest.TestCase):
         self.assertEqual(result.frames, [])
         self.assertEqual(result.truncations, 1)
 
+    def test_complete_new_record_does_not_finish_truncated_previous_frame(self):
+        new_frame = bytes.fromhex("AA 55 02 33 44")
+        result = parse_chunks(
+            [RxChunk(bytes.fromhex("AA 55 01")), RxChunk(new_frame)],
+            FrameConfig(bytes.fromhex("AA 55"), fixed_length=5),
+        )
+        self.assertEqual(result.frames, [new_frame])
+        self.assertEqual(result.truncations, 1)
+
+    def test_header_like_payload_survives_multiple_receives(self):
+        frame = bytes.fromhex("AA 55 01 AA 55 22 23")
+        result = parse_chunks(
+            [RxChunk(frame[:3]), RxChunk(frame[3:5]), RxChunk(frame[5:])],
+            FrameConfig(frame[:2], fixed_length=len(frame)),
+        )
+        self.assertEqual(result.frames, [frame])
+        self.assertFalse(result.events)
+        following = bytes.fromhex("AA 55 02 20 21 22 23")
+        result = parse_chunks(
+            [RxChunk(frame[:3]), RxChunk(frame[3:] + following)],
+            FrameConfig(frame[:2], fixed_length=len(frame)),
+        )
+        self.assertEqual(result.frames, [frame, following])
+
     def test_noise_is_counted_then_valid_frame_recovers(self):
         result = parse_chunks([RxChunk(b"\x00\xAA\x55\x01\x02\x03")], FrameConfig(b"\xAA\x55", fixed_length=5))
         self.assertEqual(result.noise_bytes, 1)

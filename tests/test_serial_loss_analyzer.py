@@ -9,9 +9,13 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from frame_parser import CrcKind, FrameConfig, FrameEvidence, FrameProtocol, OperationCancelled, RxChunk, crc16_modbus, parse_chunks
 from serial_loss_analyzer import (
     DirectionRead, LoggedChunk, SSCOM_RX_LABEL, SSCOM_TX_LABEL, analyze_cycles, analyze_time_windows,
-    analyze_log, analyze_timestamp_gaps, analyze_timestamp_windows, detect_ble_blocks, detect_protocol,
+    analyze_log, analyze_timestamp_gaps, analyze_timestamp_windows, continuous_gaps, detect_ble_blocks, detect_protocol,
     detect_sequence_field, detect_timestamp_table, match_transactions, read_directional_chunks,
 )
+
+
+def with_crc(data: bytes) -> bytes:
+    return data + crc16_modbus(data).to_bytes(2, "little")
 
 
 class SerialLogTests(unittest.TestCase):
@@ -102,7 +106,7 @@ class SerialLogTests(unittest.TestCase):
             direction_markers_found=True,
         )
         result = match_transactions(read)
-        self.assertEqual((result.paired, result.unmatched_sent, result.orphan_received, result.key_confirmed), (1, 0, 0, 1))
+        self.assertEqual((result.paired, result.unmatched_sent, result.orphan_received, result.key_confirmed), (1, 0, 0, 0))
         self.assertEqual(result.average_latency_ms, 30.0)
 
     def test_transaction_timeout_does_not_pair_stale_request(self):
@@ -115,12 +119,13 @@ class SerialLogTests(unittest.TestCase):
 
     def test_modbus_transaction_matching_uses_address_and_function_not_oldest_tx(self):
         now = datetime(1900, 1, 1, 12, 0, 0)
-        tx_one = RxChunk(b"\x01\x03\x00\x00", now, 1)
-        tx_two = RxChunk(b"\x02\x03\x00\x00", now + timedelta(milliseconds=5), 2)
-        rx_two = RxChunk(b"\x02\x03\x3c" + b"\x00" * 60, now + timedelta(milliseconds=20), 3)
+        tx_one = RxChunk(with_crc(bytes.fromhex("01 03 00 00 00 1E")), now, 1)
+        tx_two = RxChunk(with_crc(bytes.fromhex("02 03 00 00 00 1E")), now + timedelta(milliseconds=5), 2)
+        rx_two = RxChunk(with_crc(b"\x02\x03\x3c" + b"\x00" * 60), now + timedelta(milliseconds=20), 3)
+        end = RxChunk(b"\xFF", now + timedelta(seconds=2), 4)
         read = DirectionRead(
             tx_chunks=[tx_one, tx_two], rx_chunks=[rx_two],
-            records=[LoggedChunk("tx", tx_one), LoggedChunk("tx", tx_two), LoggedChunk("rx", rx_two)],
+            records=[LoggedChunk("tx", tx_one), LoggedChunk("tx", tx_two), LoggedChunk("rx", rx_two), LoggedChunk("unknown", end)],
             direction_markers_found=True,
         )
         result = match_transactions(read)
@@ -129,11 +134,12 @@ class SerialLogTests(unittest.TestCase):
 
     def test_modbus_read_response_requires_the_requested_byte_count(self):
         now = datetime(1900, 1, 1, 12, 0, 0)
-        tx = RxChunk(b"\x01\x03\x00\x00\x00\x1e\x00\x00", now, 1)
-        wrong_rx = RxChunk(b"\x01\x03\x3a" + b"\x00" * 58, now + timedelta(milliseconds=20), 2)
+        tx = RxChunk(with_crc(bytes.fromhex("01 03 00 00 00 1E")), now, 1)
+        wrong_rx = RxChunk(with_crc(b"\x01\x03\x3a" + b"\x00" * 58), now + timedelta(milliseconds=20), 2)
+        end = RxChunk(b"\xFF", now + timedelta(seconds=2), 3)
         read = DirectionRead(
             tx_chunks=[tx], rx_chunks=[wrong_rx],
-            records=[LoggedChunk("tx", tx), LoggedChunk("rx", wrong_rx)], direction_markers_found=True,
+            records=[LoggedChunk("tx", tx), LoggedChunk("rx", wrong_rx), LoggedChunk("unknown", end)], direction_markers_found=True,
         )
         result = match_transactions(read)
         self.assertEqual((result.eligible_paired, result.eligible_unmatched, result.orphan_received), (0, 1, 1))
@@ -141,14 +147,33 @@ class SerialLogTests(unittest.TestCase):
     def test_modbus_transaction_matching_skips_sscom_transport_prefix(self):
         now = datetime(1900, 1, 1, 12, 0, 0)
         # FF FF 1E is an SSCOM/transport wrapper; 01 03 is the actual request.
-        tx = RxChunk(b"\xff\xff\x1e\x01\x03\x10\x00\x00\x1e\xc1\x02", now, 1)
-        rx = RxChunk(b"\x01\x03\x3c" + b"\x00" * 60, now + timedelta(milliseconds=50), 2)
+        tx = RxChunk(bytes.fromhex("FF FF 1E") + with_crc(bytes.fromhex("01 03 10 00 00 1E")), now, 1)
+        rx = RxChunk(with_crc(b"\x01\x03\x3c" + b"\x00" * 60), now + timedelta(milliseconds=50), 2)
         read = DirectionRead(
             tx_chunks=[tx], rx_chunks=[rx],
             records=[LoggedChunk("tx", tx), LoggedChunk("rx", rx)], direction_markers_found=True,
         )
         result = match_transactions(read)
         self.assertEqual((result.eligible_sent, result.eligible_paired, result.response_loss_percent), (1, 1, 0.0))
+
+    def test_modbus_matches_only_complete_replies_and_separates_capture_tail(self):
+        now = datetime(1900, 1, 1, 12)
+        tx = RxChunk(with_crc(bytes.fromhex("01 03 00 00 00 02")), now, 1)
+        frame = with_crc(bytes.fromhex("01 03 04 00 01 00 02"))
+        prefix = RxChunk(frame[:3], now + timedelta(milliseconds=10), 2)
+        suffix = RxChunk(frame[3:], now + timedelta(milliseconds=20), 3)
+        end = RxChunk(b"\xFF", now + timedelta(seconds=2), 4)
+        read = DirectionRead(tx_chunks=[tx], records=[LoggedChunk("tx", tx)])
+        for observations in ([], [LoggedChunk("rx", prefix)]):
+            read.records[1:] = observations
+            result = match_transactions(read)
+            self.assertEqual((result.eligible_paired, result.insufficient_sent, result.response_loss_percent), (0, 1, None))
+        bad_suffix = RxChunk(suffix.data[:-1] + bytes([suffix.data[-1] ^ 1]), suffix.timestamp, suffix.line_no)
+        read.records[1:] = [LoggedChunk("rx", prefix), LoggedChunk("rx", bad_suffix), LoggedChunk("unknown", end)]
+        self.assertEqual(match_transactions(read).response_loss_percent, 100.0)
+        read.records[2] = LoggedChunk("rx", suffix)
+        result = match_transactions(read)
+        self.assertEqual((result.eligible_paired, result.insufficient_sent, result.response_loss_percent), (1, 0, 0.0))
 
     def test_time_windows_locate_missing_sequence_and_long_interval(self):
         now = datetime(1900, 1, 1, 12, 0, 0)
@@ -180,6 +205,23 @@ class SerialLogTests(unittest.TestCase):
         ]
         _, windows = analyze_time_windows(evidence, [9, 10, 1], 1, 1000, 60)
         self.assertEqual(windows[0].missing, 0)
+
+    def test_rollover_and_duplicates_use_same_counts_in_summary_and_time_windows(self):
+        now = datetime(1900, 1, 1, 12)
+        values = [254, 254, 0]
+        evidence = [FrameEvidence(b"", first_timestamp=now + timedelta(seconds=i)) for i in range(len(values))]
+        gaps, duplicates, resets = continuous_gaps(values, 1, 1000)
+        _, windows = analyze_time_windows(evidence, values, 1, 1000)
+        self.assertEqual((gaps[0].first_missing, duplicates, resets), (255, 1, 0))
+        self.assertEqual((windows[0].received, windows[0].missing), (2, gaps[0].count))
+
+    def test_retransmissions_do_not_dilute_continuous_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "retries.txt"
+            path.write_text("RX: AA 55 01\n" * 100 + "RX: AA 55 03\n", encoding="ascii")
+            result = analyze_log(path, FrameConfig(bytes.fromhex("AA 55"), fixed_length=3), 2, 1, "little", 1000)
+        self.assertEqual((result.duplicates, result.missing), (99, 1))
+        self.assertAlmostEqual(result.loss_percent, 100 / 3)
 
     def test_analyze_log_reuses_rx_only_pipeline_for_comparison(self):
         with tempfile.TemporaryDirectory() as directory:

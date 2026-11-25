@@ -18,9 +18,9 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from frame_parser import CrcKind, FrameConfig, FrameProtocol, OperationCancelled, parse_chunks
 from serial_loss_analyzer import (
-    CycleResult, Gap, analyze_cycles, analyze_log, analyze_time_windows, analyze_timestamp_gaps,
+    CycleResult, Gap, LogAnalysis, analyze_cycles, analyze_log, analyze_time_windows, analyze_timestamp_gaps,
     analyze_timestamp_windows, continuous_gaps, detect_ble_blocks, detect_modbus_rtu, detect_protocol,
-    detect_sequence_field, detect_timestamp_table, match_transactions, parse_hex, read_directional_chunks,
+    detect_sequence_field, detect_timestamp_table, match_transactions, parse_hex, read_directional_chunks, sequence_advance,
     uses_ble_block_sequence,
 )
 
@@ -772,7 +772,7 @@ class LossAnalyzerApp:
             self.table.heading(key, text=text)
             self.table.column(key, width=130, anchor="center", stretch=True)
 
-    def populate_evidence(self, parsed, sequences: list[int]) -> None:
+    def populate_evidence(self, parsed, sequences: list[int], sequence_size: int, max_gap: int, block_mode: bool) -> None:
         self.evidence.delete(*self.evidence.get_children())
         self.evidence_rows = []
         cycle_index = 0
@@ -784,15 +784,17 @@ class LossAnalyzerApp:
             if previous is None:
                 status += "；分析起点"
             else:
-                advance = sequence - previous
+                advance = sequence_advance(
+                    previous, sequence, sequence_size, max_gap, segment_on_decrease=block_mode or self.cyclic_mode,
+                )
                 if advance == 1:
                     status += "；与上一帧连续"
                 elif advance == 0:
                     status += "；重复序号"
-                elif advance > 1:
+                elif advance is not None and advance > 1:
                     status += f"；上一帧后缺 {advance - 1}"
                 else:
-                    status += "；序号回绕/新循环"
+                    status += "；区段边界/异常跳变"
             if self.cyclic_mode and cycle_index <= len(self.cycle_results):
                 cycle = self.cycle_results[cycle_index - 1]
                 if cycle.index in self.manually_ignored_cycles:
@@ -825,9 +827,10 @@ class LossAnalyzerApp:
         *, block_mode: bool = False,
     ) -> tuple[float | None, list]:
         self.time_table.delete(*self.time_table.get_children())
-        self.time_table.heading("frames", text="有效块数" if block_mode else "有效记录")
+        self.time_table.heading("frames", text="有效块数" if block_mode else "有效序号数")
         baseline, windows = analyze_time_windows(
-            parsed.frame_evidence, sequences, sequence_size, max_gap, window_seconds, block_mode=block_mode,
+            parsed.frame_evidence, sequences, sequence_size, max_gap, window_seconds,
+            block_mode=block_mode, cycle_mode=self.cyclic_mode,
         )
         for window in windows:
             average = f"{window.average_interval_ms:.1f} ms" if window.average_interval_ms is not None else "—"
@@ -838,15 +841,20 @@ class LossAnalyzerApp:
             )
         return baseline, windows
 
-    def populate_comparisons(self, config, seq_offset: int, seq_size: int, endian: str, max_gap: int, coverage: float, manual_start: int | None, manual_count: int | None) -> None:
+    def populate_comparisons(self, current: LogAnalysis, config, seq_offset: int, seq_size: int, endian: str, max_gap: int, coverage: float, manual_start: int | None, manual_count: int | None) -> None:
         self.comparison_table.delete(*self.comparison_table.get_children())
         self.comparison_rows = []
         for path in self.compare_paths:
             try:
-                analysis = analyze_log(path, config, seq_offset, seq_size, endian, max_gap, coverage, manual_start, manual_count)
+                analysis = current if path == current.path else analyze_log(
+                    path, config, seq_offset, seq_size, endian, max_gap, coverage, manual_start, manual_count,
+                )
                 direction = analysis.direction_read
                 direction_text = "原始RX" if direction.raw_binary_receive else f"{len(direction.rx_chunks)}/{len(direction.tx_chunks)}" if direction.direction_markers_found else "方向未知"
-                included_cycles = [cycle for cycle in analysis.cycle_results if cycle.included]
+                included_cycles = [
+                    cycle for cycle in analysis.cycle_results
+                    if cycle.included and (analysis is not current or cycle.index not in self.manually_ignored_cycles)
+                ]
                 worst_cycle = max(included_cycles, key=lambda cycle: cycle.missing / cycle.expected) if included_cycles else None
                 result = (
                     f"循环 {analysis.cycle_model.first_sequence}..{analysis.cycle_model.last_sequence}"
@@ -1043,24 +1051,7 @@ class LossAnalyzerApp:
                 if has_markers
                 else "日志未发现 TX/RX 方向标记：数据被标记为“方向未知”，暂按全部 HEX 数据分析。"
             )
-            timeout = self.transaction_timeout_value()
-            transaction = match_transactions(self.direction_read, timeout)
-            if has_markers and (transaction.sent or transaction.received):
-                latency = f"，平均往返 {transaction.average_latency_ms:.1f} ms" if transaction.average_latency_ms is not None else ""
-                if transaction.eligible_sent:
-                    self.transaction_note = (
-                        f"请求应答统计（TX→RX）：Modbus请求 {transaction.eligible_sent}，匹配响应 {transaction.eligible_paired}，"
-                        f"未响应 {transaction.eligible_unmatched}，未响应率 {transaction.response_loss_percent:.2f}%；"
-                        f"超时 {transaction.timed_out_sent}，孤立RX {transaction.orphan_received}{latency}。"
-                    )
-                else:
-                    self.transaction_note = (
-                        f"收发核对（不参与丢包率）：TX {transaction.sent}，RX {transaction.received}，按时间配对 {transaction.paired}，"
-                        f"未响应TX {transaction.unmatched_sent}（超时 {transaction.timed_out_sent}），孤立RX {transaction.orphan_received}，"
-                        f"未识别到可统计的 Modbus 请求{latency}。"
-                    )
-            else:
-                self.transaction_note = ""
+            self.refresh_transactions()
             ble_blocks = detect_ble_blocks(self.direction_read)
             if self.direction_read.ble_status_records:
                 self.direction_note += f" 已剥离 {self.direction_read.ble_status_records} 条 BLE DISCONNECT 状态前缀。"
@@ -1169,15 +1160,15 @@ class LossAnalyzerApp:
                 values=(window.start.strftime("%H:%M:%S"), window.received, window.missing, f"{window.loss_percent:.2f}%", average, maximum, window.long_intervals),
             )
 
-    def populate_timestamp_comparisons(self) -> None:
+    def populate_timestamp_comparisons(self, current_path: Path) -> None:
         self.comparison_table.delete(*self.comparison_table.get_children())
         self.comparison_rows = []
         for path in self.compare_paths:
             try:
-                table = detect_timestamp_table(path)
+                table = self.timestamp_table if path == current_path else detect_timestamp_table(path)
                 if table is None:
                     raise ValueError("不是同类的时间戳表格日志")
-                analysis = analyze_timestamp_gaps(table)
+                analysis = self.timestamp_gap_analysis if path == current_path else analyze_timestamp_gaps(table)
                 baseline = f"{analysis.baseline_interval_ms:.1f} ms" if analysis.baseline_interval_ms else "—"
                 threshold = f"{analysis.threshold_ms:.1f} ms" if analysis.threshold_ms else "—"
                 row = {
@@ -1193,8 +1184,8 @@ class LossAnalyzerApp:
         self.comparison_export_button.configure(state="normal" if self.comparison_rows else "disabled")
 
     def analyze_timestamp_table(self) -> None:
-        self.time_table.heading("frames", text="有效记录")
         """Analyze an already-decoded table log without pretending it is UART HEX."""
+        self.time_table.heading("frames", text="有效记录")
         if self.timestamp_table is None:
             raise ValueError("尚未识别到时间戳表格日志。")
         try:
@@ -1240,7 +1231,7 @@ class LossAnalyzerApp:
         self.set_primary_loss(analysis.gap_rate_percent, primary_label, primary_detail)
         self.populate_timestamp_evidence()
         self.populate_timestamp_windows(windows)
-        self.populate_timestamp_comparisons()
+        self.populate_timestamp_comparisons(path)
         self.result.set(
             f"{self.direction_note}\n"
             f"时间断档模式：有效记录 {analysis.received}，字段数 {self.timestamp_table.field_count}，格式异常行 {self.timestamp_table.invalid_rows}，时间倒退 {analysis.time_reversals} 次。\n"
@@ -1283,6 +1274,28 @@ class LossAnalyzerApp:
         self.evidence_export_button.configure(state="normal")
         self.report_export_button.configure(state="normal")
 
+    def refresh_transactions(self):
+        self.transaction_note = ""
+        if not self.direction_read or not self.direction_read.direction_markers_found:
+            return None
+        transaction = match_transactions(self.direction_read, self.transaction_timeout_value())
+        latency = f"，平均往返 {transaction.average_latency_ms:.1f} ms" if transaction.average_latency_ms is not None else ""
+        if transaction.eligible_sent:
+            rate = transaction.response_loss_percent
+            rate_text = f"{rate:.2f}%" if rate is not None else "观察不足"
+            self.transaction_note = (
+                f"请求应答统计（TX→RX）：Modbus请求 {transaction.eligible_sent}，匹配响应 {transaction.eligible_paired}，"
+                f"未响应 {transaction.eligible_unmatched}，观察不足 {transaction.insufficient_sent}，未响应率 {rate_text}；"
+                f"孤立RX {transaction.orphan_received}{latency}。"
+            )
+        elif transaction.sent or transaction.received:
+            self.transaction_note = (
+                f"收发核对：TX {transaction.sent}，RX {transaction.received}，按时间配对 {transaction.paired}，"
+                f"超时TX {transaction.timed_out_sent}，观察不足 {transaction.insufficient_sent}，孤立RX {transaction.orphan_received}，"
+                f"未识别到可统计的 Modbus 请求{latency}。"
+            )
+        return transaction
+
     def analyze(self) -> None:
         if self.timestamp_table is not None:
             self.analyze_timestamp_table()
@@ -1292,13 +1305,14 @@ class LossAnalyzerApp:
             self.ensure_input_chunks(path)
             parsed = self.parse_with_progress(config, "正在验证完整帧")
             captured = parsed.frames
+            transaction = self.refresh_transactions()
             current_sequence_signature = (str(seq_offset), str(seq_size), self.endian.get())
             sequence_allowed = (
                 self._auto_sequence_signature == current_sequence_signature
                 or self.manual_sequence_confirmed.get()
             )
             if not sequence_allowed:
-                self.show_sequence_unavailable(parsed, captured)
+                self.show_sequence_unavailable(parsed, captured, transaction)
                 return
             sequences = [int.from_bytes(frame[seq_offset : seq_offset + seq_size], self.endian.get()) for frame in captured]
             if not sequences:
@@ -1320,6 +1334,7 @@ class LossAnalyzerApp:
         self.cyclic_mode = cyclic is not None
         cycle_model = cyclic[0] if cyclic is not None else None
         analysis_stats = {}
+        duplicates = resets = 0
         if cyclic is not None:
             model, self.cycle_results = cyclic
             expected = model.expected
@@ -1373,15 +1388,16 @@ class LossAnalyzerApp:
             self.restore_cycles_button.configure(state="disabled")
             self.gaps, duplicates, resets = continuous_gaps(sequences, seq_size, max_gap, block_mode=block_mode)
             missing = sum(gap.count for gap in self.gaps)
-            received = len(sequences) - duplicates if block_mode else len(sequences)
+            received = len(sequences) - duplicates
             rate = 100 * missing / (received + missing)
             primary_label = "块编号缺失率" if block_mode else "连续序号丢包率"
             primary_detail = (
                 f"统计口径：有效块 {received}，块编号缺失 {missing}；相邻同号合并，编号下降划分区段。"
-                if block_mode else f"统计口径：有效完整帧 {len(sequences)}，缺失帧 {missing}；重复和异常跳变不计作丢包。"
+                if block_mode else f"统计口径：有效完整帧 {len(sequences)}，相邻去重后 {received}，缺失编号 {missing}。"
             )
             analysis_stats = {
                 "mode": "continuous", "received_frames": len(sequences), "missing_frames": missing,
+                "received_sequences": received,
                 "loss_percent": rate, "duplicates": duplicates, "restart_or_outlier": resets,
                 "gaps": [{"after": gap.after, "first_missing": gap.first_missing, "last_missing": gap.last_missing, "count": gap.count} for gap in self.gaps],
             }
@@ -1396,11 +1412,17 @@ class LossAnalyzerApp:
                 f"重复序号：{duplicates}    疑似复位/异常跳变：{resets}    缺失区段：{len(self.gaps)}\n{self.transaction_note}"
             )
         self.set_primary_loss(rate, primary_label, primary_detail)
-        self.populate_evidence(parsed, sequences)
+        self.populate_evidence(parsed, sequences, seq_size, max_gap, block_mode)
         interval_baseline, time_windows = self.populate_time_windows(
             parsed, sequences, seq_size, max_gap, time_window, block_mode=block_mode and not self.cyclic_mode,
         )
-        self.populate_comparisons(config, seq_offset, seq_size, self.endian.get(), max_gap, coverage, manual_start, manual_count)
+        current = LogAnalysis(
+            path, self.direction_read, parsed, sequences, cycle_model, self.cycle_results, self.gaps,
+            duplicates, resets, missing, rate,
+        )
+        self.populate_comparisons(
+            current, config, seq_offset, seq_size, self.endian.get(), max_gap, coverage, manual_start, manual_count,
+        )
         if time_windows:
             worst = max(time_windows, key=lambda item: (item.loss_percent, item.long_intervals, item.max_interval_ms or 0))
             baseline_text = f"基准帧间隔 {interval_baseline:.1f} ms" if interval_baseline is not None else "基准帧间隔不足"
@@ -1415,7 +1437,6 @@ class LossAnalyzerApp:
             + f"自检：{'已核对前 ' + str(credibility['checks']['previewed_frames']) + ' 帧' if credibility['checks']['previewed_current_parameters'] else '未完成'}；"
             + f"循环：{credibility['checks']['cycle_evidence']}。提示：{warning_text}。"
         )
-        transaction = match_transactions(self.direction_read, self.transaction_timeout_value()) if self.direction_read and self.direction_read.direction_markers_found else None
         file_bytes = path.read_bytes()
         self.last_report = {
             "format": "serial-loss-analysis-report", "version": 1,
@@ -1452,6 +1473,8 @@ class LossAnalyzerApp:
                 "orphan_received": transaction.orphan_received, "key_confirmed": transaction.key_confirmed,
                 "average_latency_ms": transaction.average_latency_ms,
                 "eligible_modbus_requests": transaction.eligible_sent,
+                "observed_modbus_requests": transaction.eligible_observed,
+                "insufficient_observation": transaction.insufficient_sent,
                 "matched_modbus_responses": transaction.eligible_paired,
                 "unmatched_modbus_requests": transaction.eligible_unmatched,
                 "response_loss_percent": transaction.response_loss_percent,
@@ -1463,24 +1486,23 @@ class LossAnalyzerApp:
         self.evidence_export_button.configure(state="normal")
         self.report_export_button.configure(state="normal")
 
-    def show_sequence_unavailable(self, parsed, captured: list[bytes]) -> None:
+    def show_sequence_unavailable(self, parsed, captured: list[bytes], transaction) -> None:
         """Present frame-integrity evidence without fabricating a loss rate."""
         self.table.delete(*self.table.get_children())
-        transaction = (
-            match_transactions(self.direction_read, self.transaction_timeout_value())
-            if self.direction_read and self.direction_read.direction_markers_found else None
-        )
         if transaction and transaction.response_loss_percent is not None:
-            self.set_table_headings((("after", "Modbus请求"), ("first", "匹配响应"), ("last", "未响应"), ("count", "未响应率")))
+            self.set_table_headings((("after", "可判断的 Modbus 请求"), ("first", "匹配响应"), ("last", "未响应"), ("count", "未响应率")))
             self.table.insert("", END, values=(
-                transaction.eligible_sent, transaction.eligible_paired,
+                transaction.eligible_observed, transaction.eligible_paired,
                 transaction.eligible_unmatched, f"{transaction.response_loss_percent:.4f}%",
             ))
-            detail = "按同一 Modbus 地址、功能码及读取字节数匹配 TX 请求与后续 RX 响应；每个未匹配请求计为一次未响应。"
+            detail = (
+                "仅配对 CRC 验证通过的 Modbus 请求和完整响应。"
+                f"以已应答和已观察超时的请求为分母，另有 {transaction.insufficient_sent} 条观察不足。"
+            )
             self.set_primary_loss(transaction.response_loss_percent, "请求未响应率（TX→RX）", detail)
             response_text = (
                 f"请求应答：Modbus请求 {transaction.eligible_sent}，匹配响应 {transaction.eligible_paired}，"
-                f"未响应 {transaction.eligible_unmatched}，未响应率 {transaction.response_loss_percent:.4f}%。"
+                f"未响应 {transaction.eligible_unmatched}，观察不足 {transaction.insufficient_sent}，未响应率 {transaction.response_loss_percent:.4f}%。"
             )
         else:
             self.set_table_headings((("after", "有效完整帧"), ("first", "CRC错误"), ("last", "截断"), ("count", "噪声字节")))
@@ -1491,6 +1513,8 @@ class LossAnalyzerApp:
                 "未发现可信递增序号：不计算丢包率，避免把测量值波动误判为漏包。"
                 "若协议确有序号，请填写正确偏移/字节数并勾选“手动确认以上序号字段”。"
             )
+            if transaction and transaction.eligible_sent:
+                response_text += f" Modbus 请求中有 {transaction.insufficient_sent} 条观察不足。"
         self.result.set(
             f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n"
             + response_text

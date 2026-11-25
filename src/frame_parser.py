@@ -144,11 +144,14 @@ def parse_chunks(
     if config.protocol is FrameProtocol.CUSTOM and not config.header:
         raise ValueError("header must not be empty")
     result, buffer, pending_at = ParseResult(), bytearray(), None
+    receive_boundary = 0
     origins: list[tuple[int, datetime | None]] = []
 
     def discard(count: int) -> None:
+        nonlocal receive_boundary
         del buffer[:count]
         del origins[:count]
+        receive_boundary -= count
 
     def classify_incomplete(reason: str) -> None:
         nonlocal pending_at
@@ -201,15 +204,20 @@ def parse_chunks(
                 result.events.append(ParseEvent("invalid_length", len(buffer), expected))
                 discard(1)
                 continue
-            if len(buffer) < expected:
-                # For arbitrary-address Modbus frames a payload byte can look
-                # like a function code, so a later candidate is not evidence
-                # of truncation.  Keep buffering until timeout/EOF instead.
-                later = -1 if config.protocol is FrameProtocol.MODBUS_RTU else buffer.find(config.header, 1)
-                if later > 0:
-                    result.events.append(ParseEvent("truncated", later, expected, "next header before expected tail"))
-                    discard(later)
+            # A header inside a payload is not enough to restart. Without CRC,
+            # prefer a self-contained frame starting at a new receive boundary
+            # over a frame that would consume part of that new record.
+            if (
+                config.protocol is FrameProtocol.CUSTOM and config.crc is CrcKind.NONE
+                and 0 < receive_boundary < expected and buffer.startswith(config.header, receive_boundary)
+                and not buffer.startswith(config.header, expected)
+            ):
+                fresh_size = config.frame_length(buffer[receive_boundary:])
+                if fresh_size is not None and minimum <= fresh_size <= len(buffer) - receive_boundary:
+                    result.events.append(ParseEvent("truncated", receive_boundary, expected, "new receive starts with a complete frame candidate"))
+                    discard(receive_boundary)
                     continue
+            if len(buffer) < expected:
                 return
             frame = bytes(buffer[:expected])
             if valid_crc(frame, config):
@@ -234,6 +242,7 @@ def parse_chunks(
             elapsed = (chunk.timestamp - pending_at).total_seconds() * 1000
             if elapsed > config.max_frame_gap_ms:
                 classify_incomplete(f"frame gap {elapsed:.1f} ms exceeds limit")
+        receive_boundary = len(buffer)
         buffer.extend(chunk.data)
         origins.extend([(chunk.line_no, chunk.timestamp)] * len(chunk.data))
         pending_at = chunk.timestamp or pending_at
